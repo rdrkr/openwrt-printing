@@ -1,0 +1,82 @@
+# Copyright (c) 2026 Ronen Druker.
+
+fail_fast: false
+exclude: |
+  (?x)^(
+    \.git/|
+    build/|
+    output/|
+    notes/
+  )
+repos:
+  # Security scanning
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
+
+  # Copyright header enforcement — shell, YAML
+  - repo: https://github.com/Lucas-C/pre-commit-hooks
+    rev: v1.5.6
+    hooks:
+      - id: insert-license
+        name: Check copyright headers (shell, YAML)
+        files: \.(sh|bash|yaml|yml)$
+        args:
+          - --license-filepath
+          - .copyright-header.txt
+          - --comment-style
+          - "|#|"
+          - --allow-past-years
+          - --detect-license-in-X-top-lines=3
+
+  # General file checks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+        name: Trim trailing whitespace
+      - id: end-of-file-fixer
+        name: Fix end of file
+      - id: check-yaml
+        name: Check YAML
+      - id: check-json
+        name: Check JSON
+      - id: detect-private-key
+        name: Detect private keys
+      - id: check-merge-conflict
+        name: Check for merge conflicts
+      - id: mixed-line-ending
+        name: Fix mixed line endings
+        args: [-f, lf]
+      - id: check-case-conflict
+        name: Check case conflicts
+      - id: check-executables-have-shebangs
+        name: Check executables have shebangs
+      - id: check-shebang-scripts-are-executable
+        name: Check shebang scripts are executable
+
+  # Shell script linting
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.10.0.1
+    hooks:
+      - id: shellcheck
+        name: shellcheck
+        args: ["--severity=warning"]
+
+  # Shell script formatting
+  - repo: https://github.com/scop/pre-commit-shfmt
+    rev: v3.10.0-2
+    hooks:
+      - id: shfmt
+        name: shfmt (format shell)
+        args: ["-i", "2", "-ci", "-w"]
+
+  # Markdown linting
+  - repo: https://github.com/DavidAnson/markdownlint-cli2
+    rev: v0.21.0
+    hooks:
+      - id: markdownlint-cli2
+        name: Fix Markdown
+        args:
+          - --fix
