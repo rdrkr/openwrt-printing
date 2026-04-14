@@ -1,0 +1,65 @@
+# Copyright (c) 2026 Ronen Druker.
+
+###################
+# Build artifacts
+###################
+# SDK tarball — downloaded by scripts/fetch-sdk.sh, ~180 MB, reproducible.
+build/
+# Produced .ipk files and foo2zjs tarball — build outputs, reproducible.
+output/
+# Scratch notes, background-build PIDs, stdout captures.
+notes/
+
+###################
+# Secrets & env
+###################
+*.env
+.env.local
+*.env.*.local
+*.pem
+*.key
+*.crt
+*.cert
+
+###################
+# OS
+###################
+.DS_Store
+._*
+.AppleDouble
+.LSOverride
+.Spotlight-V100
+.Trashes
+Thumbs.db
+Desktop.ini
+
+###################
+# Editors / IDEs
+###################
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+*.swp
+*.swo
+*~
+
+###################
+# Logs & temp
+###################
+*.log
+*.tmp
+*.bak
+
+###################
+# Python (none expected, but pre-commit caches)
+###################
+.venv/
+__pycache__/
+*.py[cod]
+
+###################
+# Claude Code / agent tooling
+###################
+.claude/worktrees/
+/.claude/scheduled_tasks.lock
