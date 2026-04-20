@@ -128,16 +128,19 @@ Host (Mac or Linux)
 ```markdown
 openwrt-printing/
 ├── scripts/
+│   ├── bootstrap.sh              # One-shot wrapper: build + install + configure
 │   ├── setup-container.sh        # Create openwrt-build container + named volume
 │   ├── fetch-sdk.sh              # Download + extract OpenWrt 23.05.6 ipq807x SDK
 │   ├── patch-sdk.sh              # Overlay full gnulib tree onto SDK snapshot (gettext fix)
 │   ├── prepare-feeds.sh          # Wire Vladdrako printing feed, update + install
 │   ├── configure-sdk.sh          # Write SDK .config for cups/filters/poppler/gs
 │   ├── build-stack.sh            # Cross-compile poppler + cups + gs + cups-filters
+│   ├── build-foomatic-rip.sh     # Cross-compile foomatic-rip (missing from cups-filters 1.0.37)
 │   ├── build-foo2zjs.sh          # Cross-compile foo2zjs binary + wrapper + PPD
 │   ├── install-on-router.sh      # scp *.ipk → opkg install on router
+│   ├── install-foomatic-rip.sh   # scp tarball → extract on router
 │   ├── install-foo2zjs.sh        # scp tarball → extract on router
-│   ├── configure-cups.sh         # Write cupsd.conf, open firewall ports
+│   ├── configure-cups.sh         # Write cupsd.conf, pdftops shim, open firewall
 │   └── configure-airprint.sh     # Write Avahi service file for _ipp._tcp
 ├── output/                       # Produced .ipk + foo2zjs tarball (gitignored)
 ├── build/                        # Cached SDK tarball (gitignored)
@@ -152,6 +155,37 @@ openwrt-printing/
 
 All scripts are idempotent and resume-friendly. Re-running after a failure is safe.
 
+### One-shot deploy (recommended)
+
+`scripts/bootstrap.sh` wraps the full pipeline — build, install, configure, `lpadmin`, AirPrint
+publish — behind a single CLI. Every printer-facing input is a flag; defaults target the reference
+HP LaserJet 1022. Run with `--help` for the full flag list.
+
+```bash
+# Reference HP LaserJet 1022 setup (defaults for all flags):
+./scripts/bootstrap.sh
+
+# Different printer — override the identity + driver wiring:
+./scripts/bootstrap.sh \
+  --router root@192.168.8.1 \
+  --printer-name Brother_HLL2350DW \
+  --printer-model "Brother HL-L2350DW" \
+  --printer-duplex T \
+  --device-uri usb://Brother/HL-L2350DW \
+  --ppd /usr/share/cups/model/Brother-HL-L2350DW.ppd
+
+# Re-run only the router-side steps (the build output is still in output/):
+./scripts/bootstrap.sh --skip-build
+
+# Re-push only the Avahi / CUPS config (packages already installed):
+./scripts/bootstrap.sh --skip-build --skip-install
+```
+
+### Running the stages manually
+
+If you prefer to drive each stage yourself — for debugging or when re-using pieces of the pipeline
+in another project — the stage scripts are designed to be called directly, in this order:
+
 ```bash
 # First-time environment bootstrap (~5 min on Linux amd64, ~15 min under Rosetta)
 ./scripts/setup-container.sh
@@ -164,6 +198,9 @@ All scripts are idempotent and resume-friendly. Re-running after a failure is sa
 # poppler, cups, ghostscript, cups-filters — so sibling packages run in parallel
 # under one jobserver).
 ./scripts/build-stack.sh
+
+# Cross-compile foomatic-rip (cups-filters 1.0.37 doesn't ship it).
+./scripts/build-foomatic-rip.sh
 
 # Cross-compile foo2zjs (direct toolchain invocation — not wrapped as .ipk;
 # produces a tarball that unpacks straight into /usr/lib/cups/filter/ and
