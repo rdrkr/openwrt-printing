@@ -82,10 +82,30 @@ IdleExitTimeout 60
 </Policy>
 EOF
 
-# 2) Make sure /dev/usb/lp0 is readable by CUPS (runs as root by default on OpenWrt)
-ls -la /dev/usb/lp0 || echo "WARNING: /dev/usb/lp0 not present"
+# 2) foomatic-rip invokes the renderer command via /bin/bash -c. OpenWrt ships
+# BusyBox which doesn't include a bash applet, so /bin/bash must be a real
+# bash binary. After a firmware upgrade the bash package is lost; reinstall it.
+if [ ! -x /bin/bash ]; then
+  echo '[configure-cups] /bin/bash missing — installing bash package…'
+  opkg update 2>&1 | tail -3
+  opkg install bash 2>&1
+else
+  echo "[configure-cups] /bin/bash present ($(bash --version | head -1))"
+fi
 
-# 3) PDF ingress shim. cups-filters 1.0.37 does not build its PDF filters
+# 3) CUPS' USB backend uses libusb to talk directly to the printer. The usblp
+# kernel module (from kmod-usb-printer) grabs the USB interface first, blocking
+# the libusb backend. Blacklist usblp so CUPS can claim the device. If usblp
+# is currently loaded, unload it.
+if lsmod | grep -q usblp; then
+  echo '[configure-cups] Unloading usblp kernel module…'
+  rmmod usblp 2>/dev/null || true
+fi
+mkdir -p /etc/modprobe.d
+echo 'blacklist usblp' > /etc/modprobe.d/blacklist-usblp.conf
+echo '[configure-cups] usblp blacklisted in /etc/modprobe.d/blacklist-usblp.conf'
+
+# 4) PDF ingress shim. cups-filters 1.0.37 does not build its PDF filters
 # (pdftopdf / pdftops / pdftoraster) against poppler 23.x — the upstream
 # headers moved and the 1.0.37 sources fail to compile. Without pdftops,
 # CUPS has no chain from application/pdf to application/vnd.cups-postscript
@@ -127,13 +147,13 @@ cat > /etc/cups/mime.convs <<'EOF'
 application/pdf  application/vnd.cups-postscript  50  pdftops
 EOF
 
-# 4) Enable + start cupsd (picks up the new mime.convs on startup)
+# 5) Enable + start cupsd (picks up the new mime.convs on startup)
 /etc/init.d/cupsd enable
 /etc/init.d/cupsd restart
 sleep 2
 /etc/init.d/cupsd status || true
 
-# 5) Firewall rules (LAN → CUPS and mDNS). Idempotent by name.
+# 6) Firewall rules (LAN → CUPS and mDNS). Idempotent by name.
 if ! uci show firewall | grep -q "Allow-CUPS"; then
   uci add firewall rule >/dev/null
   uci set firewall.@rule[-1].name='Allow-CUPS'

@@ -33,7 +33,7 @@ PRINTER_MODEL="HP LaserJet 1022"
 PRINTER_DESCRIPTION=""                                    # derived if empty
 PRINTER_COLOR="F"
 PRINTER_DUPLEX="F"
-DEVICE_URI="usb://HP/LaserJet%201022"
+DEVICE_URI="usb://HP/LaserJet%201022?serial=JM0GZNQ"
 PPD_PATH="/usr/share/cups/model/HP-LaserJet_1022.ppd"
 SKIP_BUILD=0
 SKIP_INSTALL=0

@@ -48,7 +48,7 @@ echo "[install] Running opkg install…"
 ssh "$ROUTER" '
   # Pull libtiff6 + glib2 from standard repos first (not built locally — available upstream).
   opkg update 2>&1 | tail -3
-  opkg install libtiff6 glib2 libusb-1.0-0 2>&1 | tail -5 || true
+  opkg install libtiff6 glib2 libusb-1.0-0 bash 2>&1 | tail -5 || true
 
   cd /tmp/printing-ipk
   # Install all .ipks except poppler (unused — see above).

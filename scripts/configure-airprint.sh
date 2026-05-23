@@ -33,15 +33,20 @@ PRINTER_DUPLEX="${PRINTER_DUPLEX:-F}"        # F = simplex only, T = duplex
 UUID_SEED="${UUID_SEED:-$(echo "$PRINTER_MODEL" | tr '[:upper:] ' '[:lower:]-').gl-be9300.local}"
 UUID="$(python3 -c "import uuid,sys; print(uuid.uuid5(uuid.NAMESPACE_DNS, sys.argv[1]))" "$UUID_SEED")"
 
-ssh "$ROUTER" \
-  PRINTER_NAME="$PRINTER_NAME" \
-  PRINTER_MODEL="$PRINTER_MODEL" \
-  PRINTER_DESCRIPTION="$PRINTER_DESCRIPTION" \
-  PRINTER_COLOR="$PRINTER_COLOR" \
-  PRINTER_DUPLEX="$PRINTER_DUPLEX" \
-  UUID="$UUID" \
-  sh -s <<'REMOTE'
+# Pass variables inside the heredoc rather than as SSH positional args.
+# SSH concatenates positional args with a space before sending to the remote
+# shell, which breaks values containing spaces (e.g. "HP LaserJet 1022" →
+# ash treats "LaserJet" as a command name). Using an unquoted heredoc
+# delimiter lets the local shell substitute the values into the script body
+# that is fed to remote stdin, avoiding the SSH word-splitting issue.
+ssh "$ROUTER" sh -s <<REMOTE
 set -euo pipefail
+PRINTER_NAME='$PRINTER_NAME'
+PRINTER_MODEL='$PRINTER_MODEL'
+PRINTER_DESCRIPTION='$PRINTER_DESCRIPTION'
+PRINTER_COLOR='$PRINTER_COLOR'
+PRINTER_DUPLEX='$PRINTER_DUPLEX'
+UUID='$UUID'
 
 # Use whichever avahi variant is present. The router typically ships with
 # avahi-dbus-daemon already installed; if neither is present, install the
@@ -50,8 +55,8 @@ set -euo pipefail
 # with libavahi-dbus-support on /usr/lib/libavahi-*.so.
 # grep -c (not -q): -q closes stdin on first match and SIGPIPEs opkg,
 # which under `set -o pipefail` propagates exit 141 and misfires the `!`.
-have_avahi=$(opkg list-installed | grep -cE '^avahi-(dbus|nodbus)-daemon ' || true)
-if [ "$have_avahi" -eq 0 ]; then
+have_avahi=\$(opkg list-installed | grep -cE '^avahi-(dbus|nodbus)-daemon ' || true)
+if [ "\$have_avahi" -eq 0 ]; then
   opkg install avahi-nodbus-daemon
 fi
 
