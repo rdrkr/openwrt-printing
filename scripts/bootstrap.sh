@@ -175,8 +175,13 @@ if [ ! -f "$PPD_PATH" ]; then
   echo "[lpadmin] expected install-foo2zjs.sh (or equivalent) to place it" >&2
   exit 1
 fi
+# Always pass -v/-P, even for an existing queue: a firmware upgrade with
+# "keep settings" preserves /etc/cups/printers.conf but wipes
+# /etc/cups/ppd/, leaving a queue with no PPD. lpadmin creates or
+# modifies, so reapplying is idempotent.
 if lpstat -p "$PRINTER_NAME" >/dev/null 2>&1; then
-  echo "[lpadmin] queue '$PRINTER_NAME' already exists — reapplying options"
+  lpadmin -p "$PRINTER_NAME" -E -v "$DEVICE_URI" -P "$PPD_PATH"
+  echo "[lpadmin] queue '$PRINTER_NAME' already exists — reapplied device and PPD"
 else
   lpadmin -p "$PRINTER_NAME" -E -v "$DEVICE_URI" -P "$PPD_PATH"
   echo "[lpadmin] created queue '$PRINTER_NAME' with device '$DEVICE_URI'"
