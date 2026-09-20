@@ -91,14 +91,14 @@ Because cups-filters 1.0.37 does not build its own `pdftops` against Poppler 23.
 
 ### Router Specs
 
-| Detail          | Value                                              |
-| --------------- | -------------------------------------------------- |
-| Model           | GL.iNet GL-BE9300 (Flint 3)                        |
-| SoC             | Qualcomm IPQ5332                                   |
-| Architecture    | `aarch64_cortex-a53_neon-vfpv4` (runtime)          |
-| CPU / RAM       | 4× Cortex-A53 / 1 GB                               |
-| Firmware        | GL.iNet v4.8.4 (OpenWrt 23.05-SNAPSHOT, QSDK 12.5) |
-| Toolchain match | GCC 12.3.0, musl 1.2.4                             |
+| Detail          | Value                                               |
+| --------------- | --------------------------------------------------- |
+| Model           | GL.iNet GL-BE9300 (Flint 3)                         |
+| SoC             | Qualcomm IPQ5332                                    |
+| Architecture    | `aarch64_cortex-a53_neon-vfpv4` (runtime)           |
+| CPU / RAM       | 4× Cortex-A53 / 1 GB                                |
+| Firmware        | GL.iNet v4.10.1 (OpenWrt 23.05-SNAPSHOT, QSDK 12.5) |
+| Toolchain match | GCC 12.3.0, musl 1.2.4                              |
 
 ---
 
@@ -278,6 +278,62 @@ ssh root@192.168.8.1 \
 For a different printer, substitute the queue name, USB URI (see `lpinfo -v` on the router), and
 PPD path. The printer then appears on iOS and macOS as an AirPrint destination named
 **"AirPrint \<PRINTER\_MODEL\> @ \<hostname\>"**.
+
+---
+
+## 🔁 After a Firmware Upgrade
+
+A GL.iNet firmware upgrade **resets `/overlay`**, which removes every package installed outside the
+firmware image — i.e. the entire printing stack. Recovery is one command, because the prebuilt
+artifacts in `output/` remain valid as long as the router's architecture and toolchain are unchanged:
+
+```bash
+# Verify the target is still the same before trusting output/:
+ssh root@192.168.8.1 'cat /etc/openwrt_release; uname -r'
+#   DISTRIB_ARCH='aarch64_cortex-a53_neon-vfpv4'  → output/*.ipk still valid
+#   anything else                                 → drop --skip-build and rebuild
+
+./scripts/bootstrap.sh --skip-build
+```
+
+### What survives an upgrade, and what does not
+
+| Survives (in `/etc`, kept by "keep settings") | Wiped (lived in `/overlay`) |
+| --------------------------------------------- | --------------------------- |
+| `arch aarch64_cortex-a53 200` in `/etc/opkg.conf` | All `.ipk` packages: `cups`, `ghostscript`, `qpdf`, `lcms2`, `openprinting-cups-filters`, … |
+| `Allow-CUPS` / `Allow-mDNS` firewall rules | `/bin/bash` (required by `foomatic-rip`) |
+| `/etc/cups/cupsd.conf` (overwritten by `configure-cups.sh` anyway) | `/usr/lib/cups/filter/{foomatic-rip,foo2zjs,foo2zjs-wrapper,pdftops}` |
+| `/etc/cups/printers.conf` — the queue definition | `/etc/cups/ppd/` — leaving the queue **pointing at a PPD that no longer exists** |
+| `avahi-dbus-daemon` (part of the GL.iNet image) | `/etc/modprobe.d/blacklist-usblp.conf`, `/etc/cups/mime.convs` |
+
+The surviving-queue-without-a-PPD case is why the `lpadmin` stage in `bootstrap.sh` always passes
+`-v` and `-P`, even when `lpstat` reports the queue already exists.
+
+### Verifying the restore
+
+```bash
+ssh root@192.168.8.1 '
+  lpstat -p HP_LaserJet_1022 -l          # expect: idle, enabled
+  ls -l /etc/cups/ppd/                   # expect: HP_LaserJet_1022.ppd, mode 644
+  netstat -lnt | grep 631                # expect: 0.0.0.0:631 LISTEN
+  lsmod | grep usblp                     # expect: no output (blacklisted)
+'
+
+# From a Mac on the LAN — Bonjour discovery and IPP capabilities:
+dns-sd -B _ipp._tcp local.               # expect: "AirPrint HP LaserJet 1022 @ GL-BE9300"
+ipptool -tv ipp://192.168.8.1:631/printers/HP_LaserJet_1022 get-printer-attributes.test \
+  | grep document-format-supported       # must include application/pdf
+
+# Physical test page through the full chain (pdftops → foomatic-rip → foo2zjs → USB):
+ssh root@192.168.8.1 'lp -d HP_LaserJet_1022 /usr/share/cups/data/default-testpage.pdf'
+```
+
+> The GL.iNet image has no `/etc/hostname`, and `/usr/share/cups/data/testprint` is detected as
+> `application/vnd.cups-pdf-banner` (rejected). Use `default-testpage.pdf` — it also exercises the
+> real AirPrint ingress path rather than a raw passthrough.
+
+Tested upgrade paths: **v4.8.4 → v4.10.1** (no rebuild needed; arch, kernel 5.4.213, and opkg feeds
+all unchanged).
 
 ---
 
