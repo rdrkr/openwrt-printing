@@ -1,0 +1,9 @@
+#!/bin/sh
+# Copyright (c) 2026 Ronen Druker.
+# 99-wan-notify — kmwan hotplug hook: re-check the active WAN on every member
+# status change. Detached so the settle delay and ntfy retries never block
+# kmwan's other hooks.
+
+[ -x /usr/sbin/wan-notify ] || exit 0
+logger -t wan-notify "kmwan: $INTERFACE is $STATUS"
+/usr/sbin/wan-notify check </dev/null >/dev/null 2>&1 &

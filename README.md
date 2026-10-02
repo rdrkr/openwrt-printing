@@ -19,7 +19,7 @@ for any other CUPS driver (`hplip`, `splix`, `gutenprint`, …) to target a diff
 
 <!-- prettier-ignore-start -->
 <!-- markdownlint-disable-next-line MD013 -->
-[Pipeline](#-print-pipeline) • [Quick Start](#-quick-start) • [Build](#-build) • [Install](#-install-on-router) • [Configure](#-configure) • [Troubleshooting](#-troubleshooting)
+[Pipeline](#️-print-pipeline) • [Quick Start](#-quick-start) • [Build](#-build) • [Install](#-install-on-router) • [Configure](#️-configure) • [WAN Notify](#-wan-switch-notifications) • [Troubleshooting](#-troubleshooting)
 <!-- prettier-ignore-end -->
 
 </div>
@@ -141,7 +141,11 @@ openwrt-printing/
 │   ├── install-foomatic-rip.sh   # scp tarball → extract on router
 │   ├── install-foo2zjs.sh        # scp tarball → extract on router
 │   ├── configure-cups.sh         # Write cupsd.conf, pdftops shim, open firewall
-│   └── configure-airprint.sh     # Write Avahi service file for _ipp._tcp
+│   ├── configure-airprint.sh     # Write Avahi service file for _ipp._tcp
+│   └── install-wan-notify.sh     # Install the WAN-switch ntfy notifier
+├── files/                        # Router-side files, laid out as on the router
+│   ├── usr/sbin/wan-notify       # Detect active-WAN changes, publish to ntfy
+│   └── etc/hotplug.d/kmwan/99-wan-notify  # kmwan hook → wan-notify check
 ├── output/                       # Produced .ipk + foo2zjs tarball (gitignored)
 ├── build/                        # Cached SDK tarball (gitignored)
 ├── CLAUDE.md                     # Agent context: plan, URLs, troubleshooting
@@ -281,6 +285,46 @@ PPD path. The printer then appears on iOS and macOS as an AirPrint destination n
 
 ---
 
+## 📣 WAN Switch Notifications
+
+Unrelated to printing, but it lives on the same router: a push notification to the phone whenever
+the router's **active** WAN changes — e.g. Ethernet drops and traffic fails over to iPhone USB
+tethering, and again when it comes back. Notifications go straight from the router to
+[ntfy](https://ntfy.sh); no Mac or cloud relay involved.
+
+GL.iNet firmware uses its own multi-WAN daemon, `kmwan` (not `mwan3`). It runs
+`/etc/hotplug.d/kmwan/*` on every member status change; our hook there calls `wan-notify check`,
+which works out which member is carrying traffic (failover mode: the online member with the
+lowest metric) and only notifies when _that_ changes. Plugging the iPhone in while Ethernet is
+healthy stays silent.
+
+```bash
+./scripts/install-wan-notify.sh          # generates a random topic and prints it
+NTFY_TOPIC=my-topic ./scripts/install-wan-notify.sh   # or pick one
+```
+
+Then in the ntfy iOS app, subscribe to that topic on `https://ntfy.sh`. Treat the topic as a password:
+anyone who knows it can read and post to it. Re-running the installer keeps the existing topic.
+
+| Event | Priority | Example |
+| ----- | -------- | ------- |
+| Failover to a backup WAN | high | **WAN: Ethernet → iPhone USB tethering** — Now on iPhone USB tethering (172.20.10.3). Ethernet had been active for 3h 12m. |
+| Back on the primary WAN | default | **WAN: iPhone USB tethering → Ethernet** — Now on Ethernet (192.168.1.2). iPhone USB tethering had been active for 14m 5s. |
+| Recovery after a full outage | — | Same, with "Internet was down for …" (nothing can be sent while every WAN is down) |
+
+```bash
+ssh root@192.168.8.1 wan-notify status      # active WAN + every member's state
+ssh root@192.168.8.1 wan-notify test        # send a test notification
+ssh root@192.168.8.1 logread -e wan-notify  # what was detected / sent
+ssh root@192.168.8.1 'uci set wan_notify.main.enabled=0; uci commit wan_notify'   # mute
+```
+
+Settings live in `/etc/config/wan_notify` (`server`, `topic`, optional `token` for a protected
+self-hosted ntfy, `settle` seconds to let kmwan settle before checking, default 5). Changes within
+the first 3 minutes after boot are recorded but not notified, since WANs come up one by one.
+
+---
+
 ## 🔁 After a Firmware Upgrade
 
 A GL.iNet firmware upgrade **resets `/overlay`**, which removes every package installed outside the
@@ -305,6 +349,7 @@ ssh root@192.168.8.1 'cat /etc/openwrt_release; uname -r'
 | `/etc/cups/cupsd.conf` (overwritten by `configure-cups.sh` anyway) | `/usr/lib/cups/filter/{foomatic-rip,foo2zjs,foo2zjs-wrapper,pdftops}` |
 | `/etc/cups/printers.conf` — the queue definition | `/etc/cups/ppd/` — leaving the queue **pointing at a PPD that no longer exists** |
 | `avahi-dbus-daemon` (part of the GL.iNet image) | `/etc/modprobe.d/blacklist-usblp.conf`, `/etc/cups/mime.convs` |
+| WAN notifier: `/etc/config/wan_notify`, plus its two files (listed in `/etc/sysupgrade.conf`) | |
 
 The surviving-queue-without-a-PPD case is why the `lpadmin` stage in `bootstrap.sh` always passes
 `-v` and `-P`, even when `lpstat` reports the queue already exists.

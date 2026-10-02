@@ -1,0 +1,255 @@
+#!/bin/sh
+# Copyright (c) 2026 Ronen Druker.
+# shellcheck shell=dash disable=SC1091
+# wan-notify — push an ntfy notification when the router's active WAN changes.
+#
+# GL.iNet firmware ships its own multi-WAN daemon (kmwan, not mwan3). kmwan
+# fires /etc/hotplug.d/kmwan/* with INTERFACE + STATUS every time a member
+# goes online/offline; our hook there calls `wan-notify check` in the
+# background. This script then works out which member is *carrying traffic*
+# and notifies only when that changes — a member going up or down while it is
+# not the active one (e.g. plugging in the iPhone while Ethernet is healthy)
+# stays silent.
+#
+# Active WAN, by kmwan mode:
+#   failover  → the online member with the lowest metric
+#   balance   → every online member, joined with "+"
+#
+# Config lives in UCI (/etc/config/wan_notify, kept across firmware upgrades):
+#   wan_notify.main.enabled  1 | 0                  (default 1)
+#   wan_notify.main.server   ntfy base URL          (default https://ntfy.sh)
+#   wan_notify.main.topic    ntfy topic — required, treat it like a password
+#   wan_notify.main.token    ntfy access token      (optional)
+#   wan_notify.main.settle   seconds to wait for kmwan to settle (default 5)
+#
+# Usage:
+#   wan-notify check    re-evaluate the active WAN, notify on change
+#   wan-notify status   print the active WAN and every member's state
+#   wan-notify test     send a test notification
+
+. /lib/functions.sh
+. /usr/share/libubox/jshn.sh
+
+STATE_FILE=/var/run/wan-notify.state
+LOCK_FILE=/var/lock/wan-notify.lock
+# Overridable so a switch can be simulated without touching a real link.
+KMWAN_PROC="${KMWAN_PROC:-/proc/gl-kmwan/config}"
+# Within this many seconds of boot, record the active WAN without notifying:
+# members come up one by one, so early transitions are boot noise.
+BOOT_GRACE=180
+
+# log MESSAGE — write MESSAGE to syslog under the wan-notify tag.
+log() {
+  logger -t wan-notify "$1"
+}
+
+# label IFACE — print a human-readable name for a kmwan member interface.
+label() {
+  case "$1" in
+    wan) echo "Ethernet" ;;
+    secondwan) echo "Ethernet 2" ;;
+    wwan) echo "Wi-Fi repeater" ;;
+    tethering) echo "iPhone USB tethering" ;;
+    modem*) echo "Cellular" ;;
+    none) echo "no WAN" ;;
+    *) echo "$1" ;;
+  esac
+}
+
+# label_list LIST — label each "+"-separated interface in LIST.
+label_list() {
+  local out="" iface
+  local IFS=+
+  for iface in $1; do
+    out="${out:+$out + }$(label "$iface")"
+  done
+  echo "$out"
+}
+
+# is_online IFACE — succeed when kmwan currently reports IFACE online.
+is_online() {
+  grep -qx "$1:online" "$KMWAN_PROC" 2>/dev/null
+}
+
+# member_line SECTION — config_foreach callback: print "metric interface" for
+# every enabled kmwan member section.
+member_line() {
+  local iface metric disabled
+  config_get iface "$1" interface
+  config_get metric "$1" metric 99
+  config_get disabled "$1" disabled 0
+  [ -n "$iface" ] && [ "$disabled" != "1" ] && echo "$metric $iface"
+}
+
+# members — print every enabled kmwan member interface, lowest metric first.
+members() {
+  config_load kmwan
+  config_foreach member_line member | sort -n | cut -d' ' -f2
+}
+
+# active_wan — print the WAN(s) currently carrying traffic, or "none".
+active_wan() {
+  local mode iface active=""
+  mode="$(uci -q get kmwan.global.mode)"
+  for iface in $(members); do
+    is_online "$iface" || continue
+    if [ "$mode" = "failover" ]; then
+      echo "$iface"
+      return
+    fi
+    active="${active:+$active+}$iface"
+  done
+  echo "${active:-none}"
+}
+
+# primary_wan — print the preferred (lowest-metric) enabled member.
+primary_wan() {
+  members | head -n1
+}
+
+# iface_ip IFACE — print IFACE's first IPv4 address, or nothing.
+iface_ip() {
+  local addr
+  json_load "$(ubus call "network.interface.$1" status 2>/dev/null)" 2>/dev/null || return
+  json_select ipv4-address 2>/dev/null || return
+  json_select 1 2>/dev/null || return
+  json_get_var addr address
+  echo "$addr"
+}
+
+# duration SECONDS — print SECONDS as a short "1h 4m" / "3m 12s" string.
+duration() {
+  local s="$1"
+  if [ "$s" -ge 3600 ]; then
+    echo "$((s / 3600))h $((s % 3600 / 60))m"
+  elif [ "$s" -ge 60 ]; then
+    echo "$((s / 60))m $((s % 60))s"
+  else
+    echo "${s}s"
+  fi
+}
+
+# uptime_s — print whole seconds since boot.
+uptime_s() {
+  cut -d. -f1 /proc/uptime
+}
+
+# send TITLE MESSAGE PRIORITY TAGS — publish one notification to ntfy.
+# Uses the JSON publish endpoint so non-ASCII titles need no header encoding.
+# Retries cover the window where the new WAN has just come up.
+send() {
+  local server topic token body
+  server="$(uci -q get wan_notify.main.server)"
+  server="${server:-https://ntfy.sh}"
+  topic="$(uci -q get wan_notify.main.topic)"
+  token="$(uci -q get wan_notify.main.token)"
+  if [ -z "$topic" ]; then
+    log "wan_notify.main.topic is not set; not sending"
+    return 1
+  fi
+
+  json_init
+  json_add_string topic "$topic"
+  json_add_string title "$1"
+  json_add_string message "$2"
+  json_add_int priority "$3"
+  json_add_array tags
+  json_add_string "" "$4"
+  json_close_array
+  body="$(json_dump)"
+
+  if curl -fsS -o /dev/null -m 10 --retry 6 --retry-delay 5 --retry-all-errors \
+    -H "Content-Type: application/json" \
+    ${token:+-H "Authorization: Bearer $token"} \
+    -d "$body" "$server"; then
+    log "sent: $1"
+  else
+    log "failed to send: $1"
+    return 1
+  fi
+}
+
+# notify_change OLD NEW SINCE — build and send the message for a switch from
+# OLD to NEW, where OLD had been active since uptime SINCE.
+notify_change() {
+  local old="$1" new="$2" since="$3" title msg priority tags ip held
+  title="WAN: $(label_list "$old") → $(label_list "$new")"
+  held="$(duration $(($(uptime_s) - since)))"
+
+  if [ "$new" = "none" ]; then
+    # Nothing to send through; the recovery message reports the outage.
+    log "all WANs offline (was $old)"
+    return 0
+  fi
+
+  ip="$(iface_ip "${new%%+*}")"
+  msg="Now on $(label_list "$new")${ip:+ ($ip)}."
+  if [ "$old" = "none" ]; then
+    msg="$msg Internet was down for $held."
+  else
+    msg="$msg $(label_list "$old") had been active for $held."
+  fi
+
+  if [ "$new" = "$(primary_wan)" ]; then
+    priority=3
+    tags=white_check_mark
+  else
+    priority=4
+    tags=warning
+  fi
+  send "$title" "$msg" "$priority" "$tags"
+}
+
+# check — compare the active WAN with the last recorded one; notify on change.
+check() {
+  local settle old since new now
+  [ "$(uci -q get wan_notify.main.enabled)" = "0" ] && return 0
+  settle="$(uci -q get wan_notify.main.settle)"
+  sleep "${settle:-5}"
+
+  exec 9>"$LOCK_FILE"
+  flock -x 9
+
+  new="$(active_wan)"
+  now="$(uptime_s)"
+  if [ -f "$STATE_FILE" ]; then
+    read -r old since <"$STATE_FILE"
+  fi
+  [ "$new" = "$old" ] && return 0
+
+  echo "$new $now" >"$STATE_FILE"
+  if [ -z "$old" ] || [ "$now" -lt "$BOOT_GRACE" ]; then
+    log "active WAN is $new (initial, not notifying)"
+    return 0
+  fi
+  log "active WAN changed: $old -> $new"
+  # Send outside the lock: retries can take up to a minute.
+  flock -u 9
+  notify_change "$old" "$new" "${since:-$now}"
+}
+
+# status — print the active WAN and every enabled member's state.
+status() {
+  local iface
+  echo "active: $(active_wan)"
+  for iface in $(members); do
+    if is_online "$iface"; then
+      echo "  $iface: online"
+    else
+      echo "  $iface: offline"
+    fi
+  done
+  [ -f "$STATE_FILE" ] && echo "recorded: $(cut -d' ' -f1 "$STATE_FILE")"
+}
+
+case "$1" in
+  check) check ;;
+  status) status ;;
+  test)
+    send "WAN notify test" "Active WAN: $(label_list "$(active_wan)")." 3 bell
+    ;;
+  *)
+    echo "usage: $0 check|status|test" >&2
+    exit 1
+    ;;
+esac
