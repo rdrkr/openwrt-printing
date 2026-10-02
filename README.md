@@ -142,9 +142,9 @@ openwrt-printing/
 │   ├── install-foo2zjs.sh        # scp tarball → extract on router
 │   ├── configure-cups.sh         # Write cupsd.conf, pdftops shim, open firewall
 │   ├── configure-airprint.sh     # Write Avahi service file for _ipp._tcp
-│   └── install-wan-notify.sh     # Install the WAN-switch ntfy notifier
+│   └── install-wan-notify.sh     # Install the WAN-switch Bark notifier
 ├── files/                        # Router-side files, laid out as on the router
-│   ├── usr/sbin/wan-notify       # Detect active-WAN changes, publish to ntfy
+│   ├── usr/sbin/wan-notify       # Detect active-WAN changes, push via Bark
 │   └── etc/hotplug.d/kmwan/99-wan-notify  # kmwan hook → wan-notify check
 ├── output/                       # Produced .ipk + foo2zjs tarball (gitignored)
 ├── build/                        # Cached SDK tarball (gitignored)
@@ -289,8 +289,10 @@ PPD path. The printer then appears on iOS and macOS as an AirPrint destination n
 
 Unrelated to printing, but it lives on the same router: a push notification to the phone whenever
 the router's **active** WAN changes — e.g. Ethernet drops and traffic fails over to iPhone USB
-tethering, and again when it comes back. Notifications go straight from the router to
-[ntfy](https://ntfy.sh); no Mac or cloud relay involved.
+tethering, and again when it comes back. Notifications go straight from the router to the free,
+open-source [Bark](https://github.com/Finb/Bark) iOS app, which delivers through Apple's push
+service. Nothing runs on the Mac. ntfy was tried first, but its iOS app only showed messages after a
+manual refresh.
 
 GL.iNet firmware uses its own multi-WAN daemon, `kmwan` (not `mwan3`). It runs
 `/etc/hotplug.d/kmwan/*` on every member status change; our hook there calls `wan-notify check`,
@@ -298,18 +300,18 @@ which works out which member is carrying traffic (failover mode: the online memb
 lowest metric) and only notifies when _that_ changes. Plugging the iPhone in while Ethernet is
 healthy stays silent.
 
+Install Bark from the App Store and open it once. It shows example URLs like
+`https://api.day.app/<key>/…`; the `<key>` part is your device key. Treat it as a password,
+because anyone who knows it can push to your phone. Re-running the installer keeps the existing key.
+
 ```bash
-./scripts/install-wan-notify.sh          # generates a random topic and prints it
-NTFY_TOPIC=my-topic ./scripts/install-wan-notify.sh   # or pick one
+BARK_KEY=<key> ./scripts/install-wan-notify.sh
 ```
 
-Then in the ntfy iOS app, subscribe to that topic on `https://ntfy.sh`. Treat the topic as a password:
-anyone who knows it can read and post to it. Re-running the installer keeps the existing topic.
-
-| Event | Priority | Example |
-| ----- | -------- | ------- |
-| Failover to a backup WAN | high | **WAN: Ethernet → iPhone USB tethering** — Now on iPhone USB tethering (172.20.10.3). Ethernet had been active for 3h 12m. |
-| Back on the primary WAN | default | **WAN: iPhone USB tethering → Ethernet** — Now on Ethernet (192.168.1.2). iPhone USB tethering had been active for 14m 5s. |
+| Event | Bark level | Example |
+| ----- | ---------- | ------- |
+| Failover to a backup WAN | time-sensitive (breaks through Focus) | **⚠️ WAN: Ethernet → iPhone USB tethering** — Now on iPhone USB tethering (172.20.10.3). Ethernet had been active for 3h 12m. |
+| Back on the primary WAN | active | **✅ WAN: iPhone USB tethering → Ethernet** — Now on Ethernet (192.168.1.2). iPhone USB tethering had been active for 14m 5s. |
 | Recovery after a full outage | — | Same, with "Internet was down for …" (nothing can be sent while every WAN is down) |
 
 ```bash
@@ -319,12 +321,12 @@ ssh root@192.168.8.1 logread -e wan-notify  # what was detected / sent
 ssh root@192.168.8.1 'uci set wan_notify.main.enabled=0; uci commit wan_notify'   # mute
 ```
 
-Settings live in `/etc/config/wan_notify` (`server`, `topic`, optional `token` for a protected
-self-hosted ntfy, `settle` seconds to let kmwan settle before checking, default 5). Changes within
+Settings live in `/etc/config/wan_notify` (`key`; `server`, default `https://api.day.app`, or a
+self-hosted bark-server; `settle`, seconds to let kmwan settle before checking, default 5). Changes within
 the first 3 minutes after boot are recorded but not notified, since WANs come up one by one.
-Publishing retries for about a minute; if the router's own resolver can't resolve the ntfy server
+Publishing retries for about a minute; if the router's own resolver can't resolve the Bark server
 (dnsmasq is often briefly unusable right after a WAN switch or VPN reconnect), retries resolve it
-over DNS-over-HTTPS via `1.1.1.1` / `8.8.8.8` instead.
+over DNS-over-HTTPS via `1.1.1.1` / `8.8.8.8` instead. A rejected key fails at once without retrying.
 
 ---
 

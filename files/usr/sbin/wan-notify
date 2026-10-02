@@ -1,7 +1,7 @@
 #!/bin/sh
 # Copyright (c) 2026 Ronen Druker.
 # shellcheck shell=dash disable=SC1091
-# wan-notify — push an ntfy notification when the router's active WAN changes.
+# wan-notify — push a Bark (iOS) notification when the router's active WAN changes.
 #
 # GL.iNet firmware ships its own multi-WAN daemon (kmwan, not mwan3). kmwan
 # fires /etc/hotplug.d/kmwan/* with INTERFACE + STATUS every time a member
@@ -17,9 +17,8 @@
 #
 # Config lives in UCI (/etc/config/wan_notify, kept across firmware upgrades):
 #   wan_notify.main.enabled  1 | 0                  (default 1)
-#   wan_notify.main.server   ntfy base URL          (default https://ntfy.sh)
-#   wan_notify.main.topic    ntfy topic — required, treat it like a password
-#   wan_notify.main.token    ntfy access token      (optional)
+#   wan_notify.main.server   Bark server URL        (default https://api.day.app)
+#   wan_notify.main.key      Bark device key — required, treat it like a password
 #   wan_notify.main.settle   seconds to wait for kmwan to settle (default 5)
 #
 # Usage:
@@ -40,7 +39,7 @@ BOOT_GRACE=180
 # Publish attempts, 5s apart (~1 min total), before giving up.
 SEND_ATTEMPTS=12
 # DNS-over-HTTPS resolvers (by IP, so they need no DNS themselves) used when
-# the local resolver cannot resolve the ntfy server.
+# the local resolver cannot resolve the Bark server.
 DOH_PRIMARY=https://1.1.1.1/dns-query
 DOH_SECONDARY=https://8.8.8.8/dns-query
 
@@ -140,43 +139,43 @@ uptime_s() {
   cut -d. -f1 /proc/uptime
 }
 
-# send TITLE MESSAGE PRIORITY TAGS — publish one notification to ntfy.
-# Uses the JSON publish endpoint so non-ASCII titles need no header encoding.
+# send TITLE BODY LEVEL — push one notification through Bark.
+# LEVEL is a Bark interruption level: "active" (normal) or "timeSensitive"
+# (breaks through Focus modes). Uses the JSON endpoint so non-ASCII text needs
+# no URL encoding; Bark answers 4xx for a bad key, which curl -f reports.
 # Retries cover the window where the new WAN has just come up; on a DNS
 # failure, later attempts bypass the local resolver via DNS-over-HTTPS.
 send() {
-  local server topic token body
+  local server key body
   server="$(uci -q get wan_notify.main.server)"
-  server="${server:-https://ntfy.sh}"
-  topic="$(uci -q get wan_notify.main.topic)"
-  token="$(uci -q get wan_notify.main.token)"
-  if [ -z "$topic" ]; then
-    log "wan_notify.main.topic is not set; not sending"
+  server="${server:-https://api.day.app}"
+  key="$(uci -q get wan_notify.main.key)"
+  if [ -z "$key" ]; then
+    log "wan_notify.main.key is not set; not sending"
     return 1
   fi
 
   json_init
-  json_add_string topic "$topic"
+  json_add_string device_key "$key"
   json_add_string title "$1"
-  json_add_string message "$2"
-  json_add_int priority "$3"
-  json_add_array tags
-  json_add_string "" "$4"
-  json_close_array
+  json_add_string body "$2"
+  json_add_string level "$3"
+  json_add_string group "WAN"
   body="$(json_dump)"
 
   local attempt=1 doh="" rc
   while :; do
     curl -fsS -o /dev/null -m 10 ${doh:+--doh-url "$doh"} \
-      -H "Content-Type: application/json" \
-      ${token:+-H "Authorization: Bearer $token"} \
-      -d "$body" "$server"
+      -H "Content-Type: application/json; charset=utf-8" \
+      -d "$body" "$server/push"
     rc=$?
     if [ "$rc" -eq 0 ]; then
       log "sent: $1${doh:+ (via DoH $doh)}"
       return 0
     fi
-    if [ "$attempt" -ge "$SEND_ATTEMPTS" ]; then
+    # Exit 22 = HTTP error status: Bark rejected the request (e.g. a bad
+    # device key), which retrying will not fix.
+    if [ "$rc" -eq 22 ] || [ "$attempt" -ge "$SEND_ATTEMPTS" ]; then
       log "failed to send after $attempt attempts (curl exit $rc): $1"
       return 1
     fi
@@ -199,7 +198,7 @@ send() {
 # notify_change OLD NEW SINCE — build and send the message for a switch from
 # OLD to NEW, where OLD had been active since uptime SINCE.
 notify_change() {
-  local old="$1" new="$2" since="$3" title msg priority tags ip held
+  local old="$1" new="$2" since="$3" title msg level ip held
   title="WAN: $(label_list "$old") → $(label_list "$new")"
   held="$(duration $(($(uptime_s) - since)))"
 
@@ -218,13 +217,13 @@ notify_change() {
   fi
 
   if [ "$new" = "$(primary_wan)" ]; then
-    priority=3
-    tags=white_check_mark
+    title="✅ $title"
+    level=active
   else
-    priority=4
-    tags=warning
+    title="⚠️ $title"
+    level=timeSensitive
   fi
-  send "$title" "$msg" "$priority" "$tags"
+  send "$title" "$msg" "$level"
 }
 
 # check — compare the active WAN with the last recorded one; notify on change.
@@ -273,7 +272,7 @@ case "$1" in
   check) check ;;
   status) status ;;
   test)
-    send "WAN notify test" "Active WAN: $(label_list "$(active_wan)")." 3 bell
+    send "WAN notify test" "Active WAN: $(label_list "$(active_wan)")." active
     ;;
   *)
     echo "usage: $0 check|status|test" >&2
