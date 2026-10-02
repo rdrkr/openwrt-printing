@@ -322,6 +322,9 @@ ssh root@192.168.8.1 'uci set wan_notify.main.enabled=0; uci commit wan_notify' 
 Settings live in `/etc/config/wan_notify` (`server`, `topic`, optional `token` for a protected
 self-hosted ntfy, `settle` seconds to let kmwan settle before checking, default 5). Changes within
 the first 3 minutes after boot are recorded but not notified, since WANs come up one by one.
+Publishing retries for about a minute; if the router's own resolver can't resolve the ntfy server
+(dnsmasq is often briefly unusable right after a WAN switch or VPN reconnect), retries resolve it
+over DNS-over-HTTPS via `1.1.1.1` / `8.8.8.8` instead.
 
 ---
 

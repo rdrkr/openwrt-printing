@@ -37,6 +37,12 @@ KMWAN_PROC="${KMWAN_PROC:-/proc/gl-kmwan/config}"
 # Within this many seconds of boot, record the active WAN without notifying:
 # members come up one by one, so early transitions are boot noise.
 BOOT_GRACE=180
+# Publish attempts, 5s apart (~1 min total), before giving up.
+SEND_ATTEMPTS=12
+# DNS-over-HTTPS resolvers (by IP, so they need no DNS themselves) used when
+# the local resolver cannot resolve the ntfy server.
+DOH_PRIMARY=https://1.1.1.1/dns-query
+DOH_SECONDARY=https://8.8.8.8/dns-query
 
 # log MESSAGE — write MESSAGE to syslog under the wan-notify tag.
 log() {
@@ -136,7 +142,8 @@ uptime_s() {
 
 # send TITLE MESSAGE PRIORITY TAGS — publish one notification to ntfy.
 # Uses the JSON publish endpoint so non-ASCII titles need no header encoding.
-# Retries cover the window where the new WAN has just come up.
+# Retries cover the window where the new WAN has just come up; on a DNS
+# failure, later attempts bypass the local resolver via DNS-over-HTTPS.
 send() {
   local server topic token body
   server="$(uci -q get wan_notify.main.server)"
@@ -158,15 +165,35 @@ send() {
   json_close_array
   body="$(json_dump)"
 
-  if curl -fsS -o /dev/null -m 10 --retry 6 --retry-delay 5 --retry-all-errors \
-    -H "Content-Type: application/json" \
-    ${token:+-H "Authorization: Bearer $token"} \
-    -d "$body" "$server"; then
-    log "sent: $1"
-  else
-    log "failed to send: $1"
-    return 1
-  fi
+  local attempt=1 doh="" rc
+  while :; do
+    curl -fsS -o /dev/null -m 10 ${doh:+--doh-url "$doh"} \
+      -H "Content-Type: application/json" \
+      ${token:+-H "Authorization: Bearer $token"} \
+      -d "$body" "$server"
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+      log "sent: $1${doh:+ (via DoH $doh)}"
+      return 0
+    fi
+    if [ "$attempt" -ge "$SEND_ATTEMPTS" ]; then
+      log "failed to send after $attempt attempts (curl exit $rc): $1"
+      return 1
+    fi
+    # Exit 6 = could not resolve host. dnsmasq is often briefly unusable
+    # right after a WAN switch or a VPN reconnect (it restarts, or its
+    # upstream just went away), so resolve over HTTPS instead, alternating
+    # resolvers in case one is unreachable from the new WAN.
+    if [ "$rc" -eq 6 ]; then
+      case "$doh" in
+        "$DOH_PRIMARY") doh="$DOH_SECONDARY" ;;
+        *) doh="$DOH_PRIMARY" ;;
+      esac
+      log "cannot resolve $server, retrying via DoH $doh"
+    fi
+    attempt=$((attempt + 1))
+    sleep 5
+  done
 }
 
 # notify_change OLD NEW SINCE — build and send the message for a switch from
