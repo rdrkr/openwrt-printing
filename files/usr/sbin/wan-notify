@@ -1,7 +1,8 @@
 #!/bin/sh
 # Copyright (c) 2026 Ronen Druker.
 # shellcheck shell=dash disable=SC1091
-# wan-notify — push a Bark (iOS) notification when the router's active WAN changes.
+# wan-notify — push a Bark (iOS) notification when the router's active WAN
+# changes, or when a VPN tunnel fails over to another profile.
 #
 # GL.iNet firmware ships its own multi-WAN daemon (kmwan, not mwan3). kmwan
 # fires /etc/hotplug.d/kmwan/* with INTERFACE + STATUS every time a member
@@ -15,6 +16,12 @@
 #   failover  → the online member with the lowest metric
 #   balance   → every online member, joined with "+"
 #
+# VPN tunnels (GL.iNet VPN Dashboard → route_policy rules) each carry an
+# ordered profile list in /etc/vpn_profiles.d/; when the tunnel's interface
+# goes down, GL's tunnel-switch.sh moves it to the next profile by rewriting
+# the rule's peer_id. `wan-notify vpn-check` (run from an iface hotplug hook
+# and every minute from cron) notifies when a rule's profile changes.
+#
 # Config lives in UCI (/etc/config/wan_notify, kept across firmware upgrades):
 #   wan_notify.main.enabled  1 | 0                  (default 1)
 #   wan_notify.main.server   Bark server URL        (default https://api.day.app)
@@ -22,14 +29,17 @@
 #   wan_notify.main.settle   seconds to wait for kmwan to settle (default 5)
 #
 # Usage:
-#   wan-notify check    re-evaluate the active WAN, notify on change
-#   wan-notify status   print the active WAN and every member's state
-#   wan-notify test     send a test notification
+#   wan-notify check      re-evaluate the active WAN, notify on change
+#   wan-notify vpn-check  re-evaluate every VPN tunnel's profile, notify on change
+#   wan-notify status     print the active WAN, members and VPN tunnels
+#   wan-notify test       send a test notification
 
 . /lib/functions.sh
 . /usr/share/libubox/jshn.sh
 
 STATE_FILE=/var/run/wan-notify.state
+# One file per VPN tunnel_id: "<profile> <uptime when it became active>".
+VPN_STATE_DIR=/var/run/wan-notify.vpn
 LOCK_FILE=/var/lock/wan-notify.lock
 # Overridable so a switch can be simulated without touching a real link.
 KMWAN_PROC="${KMWAN_PROC:-/proc/gl-kmwan/config}"
@@ -139,10 +149,143 @@ uptime_s() {
   cut -d. -f1 /proc/uptime
 }
 
-# send TITLE BODY LEVEL — push one notification through Bark.
+# vpn_rule SECTION — config_foreach callback: print every enabled route_policy
+# rule that sends traffic through a VPN client (WireGuard or OpenVPN).
+vpn_rule() {
+  local enabled via_type
+  config_get enabled "$1" enabled 0
+  config_get via_type "$1" via_type
+  [ "$enabled" = "1" ] || return 0
+  case "$via_type" in
+    wireguard | openvpn) echo "$1" ;;
+  esac
+}
+
+# vpn_rules — print the route_policy section of every enabled VPN tunnel.
+vpn_rules() {
+  config_load route_policy
+  config_foreach vpn_rule rule
+}
+
+# rule_get SECTION OPTION — print route_policy.SECTION.OPTION.
+rule_get() {
+  uci -q get "route_policy.$1.$2"
+}
+
+# vpn_profile SECTION — print the tunnel's current profile id in the same
+# "<group>_<peer>" form tunnel-switch.sh uses in /etc/vpn_profiles.d/.
+vpn_profile() {
+  local id
+  id="$(rule_get "$1" peer_id)"
+  [ -n "$id" ] || id="$(rule_get "$1" client_id)"
+  [ -n "$id" ] && echo "$(rule_get "$1" group_id)_$id"
+}
+
+# profile_name SECTION PROFILE — print a profile's display name (its imported
+# config file name without ".conf"), or PROFILE itself when it has none.
+profile_name() {
+  local id="${2#*_}" name
+  if [ "$(rule_get "$1" via_type)" = "openvpn" ]; then
+    name="$(uci -q get "ovpnclient.client_$id.name")"
+  else
+    name="$(uci -q get "wireguard.peer_$id.name")"
+  fi
+  name="${name%.conf}"
+  echo "${name:-$2}"
+}
+
+# profile_index SECTION PROFILE — print PROFILE's 1-based position in the
+# tunnel's fallback list (1 = primary), or nothing when it is not listed.
+profile_index() {
+  local list
+  list="$(rule_get "$1" profiles)"
+  [ -f "$list" ] && grep -nxF "$2" "$list" | cut -d: -f1
+}
+
+# profile_count SECTION — print how many profiles the tunnel can fall back to.
+profile_count() {
+  local list
+  list="$(rule_get "$1" profiles)"
+  if [ -f "$list" ]; then
+    grep -c . "$list"
+  else
+    echo 1
+  fi
+}
+
+# notify_vpn_change SECTION OLD NEW SINCE — build and send the message for a
+# tunnel moving from profile OLD to NEW, where OLD was active since uptime SINCE.
+notify_vpn_change() {
+  local section="$1" old="$2" new="$3" since="$4"
+  local tunnel title msg level idx count held
+  tunnel="$(rule_get "$section" name)"
+  idx="$(profile_index "$section" "$new")"
+  count="$(profile_count "$section")"
+  held="$(duration $(($(uptime_s) - since)))"
+  title="$tunnel: $(profile_name "$section" "$old") → $(profile_name "$section" "$new")"
+
+  if [ "$idx" = "1" ]; then
+    title="✅ $title"
+    msg="Back on the primary profile"
+    level=active
+  else
+    title="⚠️ $title"
+    msg="Switched to fallback profile ${idx:-?} of $count"
+    level=timeSensitive
+  fi
+  msg="$msg ($(rule_get "$section" via)). $(profile_name "$section" "$old") had been active for $held."
+  send "$title" "$msg" "$level" VPN
+}
+
+# vpn_check — compare every VPN tunnel's current profile with the recorded
+# one; notify on change. Called from the iface hotplug hook and from cron.
+vpn_check() {
+  local settle section tid profile old since now changes=""
+  [ "$(uci -q get wan_notify.main.enabled)" = "0" ] && return 0
+  settle="$(uci -q get wan_notify.main.settle)"
+  sleep "${settle:-5}"
+
+  exec 9>"$LOCK_FILE"
+  flock -x 9
+
+  mkdir -p "$VPN_STATE_DIR"
+  now="$(uptime_s)"
+  for section in $(vpn_rules); do
+    tid="$(rule_get "$section" tunnel_id)"
+    profile="$(vpn_profile "$section")"
+    [ -n "$tid" ] && [ -n "$profile" ] || continue
+    old="" since=""
+    if [ -f "$VPN_STATE_DIR/$tid" ]; then
+      read -r old since <"$VPN_STATE_DIR/$tid"
+    fi
+    [ "$profile" = "$old" ] && continue
+
+    echo "$profile $now" >"$VPN_STATE_DIR/$tid"
+    if [ -z "$old" ] || [ "$now" -lt "$BOOT_GRACE" ]; then
+      log "$(rule_get "$section" name) is on $profile (initial, not notifying)"
+      continue
+    fi
+    log "$(rule_get "$section" name) profile changed: $old -> $profile"
+    changes="$changes $section:$old:$profile:${since:-$now}"
+  done
+  # Send outside the lock: retries can take up to a minute.
+  flock -u 9
+
+  local change rest
+  for change in $changes; do
+    section="${change%%:*}"
+    rest="${change#*:}"
+    old="${rest%%:*}"
+    rest="${rest#*:}"
+    notify_vpn_change "$section" "$old" "${rest%%:*}" "${rest#*:}"
+  done
+}
+
+# send TITLE BODY LEVEL [GROUP] — push one notification through Bark.
 # LEVEL is a Bark interruption level: "active" (normal) or "timeSensitive"
-# (breaks through Focus modes). Uses the JSON endpoint so non-ASCII text needs
-# no URL encoding; Bark answers 4xx for a bad key, which curl -f reports.
+# (breaks through Focus modes); GROUP is the Bark group (default "WAN").
+# Uses the JSON endpoint so non-ASCII text needs no URL encoding; Bark
+# answers 4xx for a bad key, which curl -f reports.
 # Retries cover the window where the new WAN has just come up; on a DNS
 # failure, later attempts bypass the local resolver via DNS-over-HTTPS.
 send() {
@@ -160,7 +303,7 @@ send() {
   json_add_string title "$1"
   json_add_string body "$2"
   json_add_string level "$3"
-  json_add_string group "WAN"
+  json_add_string group "${4:-WAN}"
   body="$(json_dump)"
 
   local attempt=1 doh="" rc
@@ -266,16 +409,26 @@ status() {
     fi
   done
   [ -f "$STATE_FILE" ] && echo "recorded: $(cut -d' ' -f1 "$STATE_FILE")"
+
+  local section tid profile
+  for section in $(vpn_rules); do
+    tid="$(rule_get "$section" tunnel_id)"
+    profile="$(vpn_profile "$section")"
+    echo "$(rule_get "$section" name) (tunnel $tid, $(rule_get "$section" via)):" \
+      "$(profile_name "$section" "$profile")" \
+      "[profile $(profile_index "$section" "$profile") of $(profile_count "$section")]"
+  done
 }
 
 case "$1" in
   check) check ;;
+  vpn-check) vpn_check ;;
   status) status ;;
   test)
     send "WAN notify test" "Active WAN: $(label_list "$(active_wan)")." active
     ;;
   *)
-    echo "usage: $0 check|status|test" >&2
+    echo "usage: $0 check|vpn-check|status|test" >&2
     exit 1
     ;;
 esac

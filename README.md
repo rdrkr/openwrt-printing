@@ -19,7 +19,7 @@ for any other CUPS driver (`hplip`, `splix`, `gutenprint`, …) to target a diff
 
 <!-- prettier-ignore-start -->
 <!-- markdownlint-disable-next-line MD013 -->
-[Pipeline](#️-print-pipeline) • [Quick Start](#-quick-start) • [Build](#-build) • [Install](#-install-on-router) • [Configure](#️-configure) • [WAN Notify](#-wan-switch-notifications) • [Troubleshooting](#-troubleshooting)
+[Pipeline](#️-print-pipeline) • [Quick Start](#-quick-start) • [Build](#-build) • [Install](#-install-on-router) • [Configure](#️-configure) • [WAN Notify](#-wan--vpn-switch-notifications) • [Troubleshooting](#-troubleshooting)
 <!-- prettier-ignore-end -->
 
 </div>
@@ -145,7 +145,8 @@ openwrt-printing/
 │   └── install-wan-notify.sh     # Install the WAN-switch Bark notifier
 ├── files/                        # Router-side files, laid out as on the router
 │   ├── usr/sbin/wan-notify       # Detect active-WAN changes, push via Bark
-│   └── etc/hotplug.d/kmwan/99-wan-notify  # kmwan hook → wan-notify check
+│   ├── etc/hotplug.d/kmwan/99-wan-notify  # kmwan hook → wan-notify check
+│   └── etc/hotplug.d/iface/99-wan-notify-vpn  # VPN iface hook → wan-notify vpn-check
 ├── output/                       # Produced .ipk + foo2zjs tarball (gitignored)
 ├── build/                        # Cached SDK tarball (gitignored)
 ├── CLAUDE.md                     # Agent context: plan, URLs, troubleshooting
@@ -285,7 +286,7 @@ PPD path. The printer then appears on iOS and macOS as an AirPrint destination n
 
 ---
 
-## 📣 WAN Switch Notifications
+## 📣 WAN & VPN Switch Notifications
 
 Unrelated to printing, but it lives on the same router: a push notification to the phone whenever
 the router's **active** WAN changes — e.g. Ethernet drops and traffic fails over to iPhone USB
@@ -314,8 +315,25 @@ BARK_KEY=<key> ./scripts/install-wan-notify.sh
 | Back on the primary WAN | active | **✅ WAN: iPhone USB tethering → Ethernet** — Now on Ethernet (192.168.1.2). iPhone USB tethering had been active for 14m 5s. |
 | Recovery after a full outage | — | Same, with "Internet was down for …" (nothing can be sent while every WAN is down) |
 
+The same notifier also reports **VPN tunnel profile failovers**. Each VPN Dashboard tunnel (e.g. IL
+Tunnel, IT Tunnel) is a `route_policy` rule with an ordered profile list in `/etc/vpn_profiles.d/`.
+When the tunnel's `wgclient`/`ovpnclient` interface goes down, GL's `tunnel-switch.sh` rewrites the
+rule's `peer_id` to the next profile and restarts the interface. The iface hook
+`99-wan-notify-vpn` runs `wan-notify vpn-check` on that interface's ifup/ifdown, and it notifies when
+any tunnel's profile differs from the last one recorded. Profile names come from the imported
+config file name.
+
+| Event | Bark level | Example |
+| ----- | ---------- | ------- |
+| Tunnel fails over to a backup profile | time-sensitive | **⚠️ IL Tunnel: Israel_via_SW-SE-IL-1 → Israel_via_IC-IS-IL-1** — Switched to fallback profile 2 of 2 (wgclient2). Israel_via_SW-SE-IL-1 had been active for 3h 12m. |
+| Tunnel back on its primary profile | active | **✅ IT Tunnel: France-CH-FR-2 → Italy-CH-IT-2** — Back on the primary profile (wgclient1). France-CH-FR-2 had been active for 12m 34s. |
+
+There is no event to hook when `tunnel-switch.sh` points a tunnel at an interface that is already up
+with the target profile, which only happens when two tunnels share a profile. In that case the change
+is reported at the next ifup/ifdown of any VPN interface.
+
 ```bash
-ssh root@192.168.8.1 wan-notify status      # active WAN + every member's state
+ssh root@192.168.8.1 wan-notify status      # active WAN, every member, every VPN tunnel's profile
 ssh root@192.168.8.1 wan-notify test        # send a test notification
 ssh root@192.168.8.1 logread -e wan-notify  # what was detected / sent
 ssh root@192.168.8.1 'uci set wan_notify.main.enabled=0; uci commit wan_notify'   # mute

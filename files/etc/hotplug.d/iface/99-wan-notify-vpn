@@ -1,0 +1,20 @@
+#!/bin/sh
+# Copyright (c) 2026 Ronen Druker.
+# 99-wan-notify-vpn — iface hotplug hook: re-check every VPN tunnel's profile
+# when a VPN client interface goes up or down. GL's tunnel-switch.sh fails a
+# tunnel over by rewriting its profile and restarting the interface, so the
+# ifup that follows is the moment the new profile is in place. Detached so
+# the settle delay and Bark retries never block other hooks.
+
+case "$INTERFACE" in
+  wgclient* | ovpnclient[0-9]*) ;;
+  *) exit 0 ;;
+esac
+case "$ACTION" in
+  ifup | ifdown) ;;
+  *) exit 0 ;;
+esac
+
+[ -x /usr/sbin/wan-notify ] || exit 0
+logger -t wan-notify "iface: $INTERFACE $ACTION"
+/usr/sbin/wan-notify vpn-check </dev/null >/dev/null 2>&1 &

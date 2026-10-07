@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Copyright (c) 2026 Ronen Druker.
-# install-wan-notify.sh — install the WAN-switch Bark notifier on the router.
+# install-wan-notify.sh — install the WAN / VPN-profile switch Bark notifier on the router.
 #
-# Copies files/usr/sbin/wan-notify and its kmwan hotplug hook, writes
-# /etc/config/wan_notify, lists both files in /etc/sysupgrade.conf so they
-# survive a firmware upgrade, and sends a test notification.
+# Copies files/usr/sbin/wan-notify and its two hotplug hooks (kmwan for WAN
+# switches, iface for VPN profile switches), writes /etc/config/wan_notify,
+# lists all three files in /etc/sysupgrade.conf so they survive a firmware
+# upgrade, and sends a test notification.
 #
 # The Bark device key is the only secret: anyone who knows it can push to your
 # phone. Get it from the Bark iOS app (the part after https://api.day.app/ in
@@ -35,11 +36,12 @@ echo "[wan-notify] Copying files to $ROUTER…"
 # -O forces legacy SCP protocol — OpenWrt's dropbear lacks sftp-server.
 scp -O -q "$FILES_DIR/usr/sbin/wan-notify" "$ROUTER":/usr/sbin/wan-notify
 scp -O -q "$FILES_DIR/etc/hotplug.d/kmwan/99-wan-notify" "$ROUTER":/etc/hotplug.d/kmwan/99-wan-notify
+scp -O -q "$FILES_DIR/etc/hotplug.d/iface/99-wan-notify-vpn" "$ROUTER":/etc/hotplug.d/iface/99-wan-notify-vpn
 
 echo "[wan-notify] Configuring…"
 ssh "$ROUTER" BARK_KEY="$BARK_KEY" BARK_SERVER="$BARK_SERVER" sh -s <<'REMOTE'
 set -eu
-chmod 755 /usr/sbin/wan-notify /etc/hotplug.d/kmwan/99-wan-notify
+chmod 755 /usr/sbin/wan-notify /etc/hotplug.d/kmwan/99-wan-notify /etc/hotplug.d/iface/99-wan-notify-vpn
 
 touch /etc/config/wan_notify
 uci -q get wan_notify.main >/dev/null || uci set wan_notify.main=notify
@@ -53,12 +55,13 @@ uci commit wan_notify
 
 # Custom files outside /etc/config are dropped by a firmware upgrade unless
 # listed here.
-for f in /usr/sbin/wan-notify /etc/hotplug.d/kmwan/99-wan-notify; do
+for f in /usr/sbin/wan-notify /etc/hotplug.d/kmwan/99-wan-notify /etc/hotplug.d/iface/99-wan-notify-vpn; do
   grep -qxF "$f" /etc/sysupgrade.conf || echo "$f" >>/etc/sysupgrade.conf
 done
 
-# Seed the state file so the next real switch is reported against it.
+# Seed the state files so the next real switch is reported against them.
 /usr/sbin/wan-notify check
+/usr/sbin/wan-notify vpn-check
 /usr/sbin/wan-notify status
 /usr/sbin/wan-notify test
 REMOTE
